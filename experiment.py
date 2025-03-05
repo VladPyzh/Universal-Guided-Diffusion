@@ -4,16 +4,166 @@ import numpy as np
 import torch
 import cv2
 from tqdm import tqdm
+from PIL import Image
+from glob import glob
 import matplotlib.pyplot as plt
 from typing import Dict, Optional
+from collections import defaultdict
+import argparse
 
 import torch.nn as nn
 import torchvision.transforms as transforms
+from torchvision.transforms.functional import pil_to_tensor
 import torchvision.transforms.functional as TF
-from torchvision.models.segmentation import lraspp_mobilenet_v3_large, LRASPP_MobileNet_V3_Large_Weights
+from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights
 from diffusers import StableDiffusionPipeline, DDIMScheduler
 
 
+class GuidanceFunctionBBox:
+    def __init__(self, device: str = "cuda"):
+        self.device = device
+        
+        weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
+        self.model = fasterrcnn_resnet50_fpn_v2(
+            weights=weights, box_score_thresh=0.5).to(device)
+        self.preprocess = weights.transforms().to(device)
+        
+        for param in self.model.parameters():
+            param.requires_grad = False
+        
+        self.categories = weights.meta["categories"]
+
+        annotation_paths = glob("./processed_data/*/bbox_annotations.json")
+        self.bbox_annotations = defaultdict()
+
+        for path in annotation_paths:
+            label = path.split("/")[2]
+            
+            with open(path, "r") as f:
+                annotation = json.load(f)
+                
+            self.bbox_annotations[label] = annotation
+
+    
+    def _preprocess_image(self, image: torch.Tensor) -> torch.Tensor:
+        image = (image + 1) * 0.5
+        image = self.preprocess(image)
+
+        return image
+
+
+    def _get_bbox_for_class(self, detections: list, target_class: int) -> list:
+        matching_indices = [
+            i for i, label in enumerate(detections[0]['labels'])
+            if label == target_class
+        ]
+
+        if not matching_indices:
+            return None
+
+        first_match_index = matching_indices[0]
+        bbox = detections[0]['boxes'][first_match_index]
+
+        bbox_coords = bbox.cpu().tolist()
+        
+        return bbox_coords
+
+
+    def _compute_bbox(self, image: torch.Tensor, cur_class: str) -> torch.Tensor:
+        self.model.eval()
+        processed_image = self._preprocess_image(image)
+
+        bboxes = self.model(processed_image)
+        label_id = self.categories.index(cur_class)
+        
+        return self._get_bbox_for_class(bboxes, label_id)
+
+    def _visualize_bounding_box(self, image, bounding_box, ax=None):
+        image = (image + 1) * 0.5
+        
+        if torch.is_tensor(image):
+            image = image.squeeze(0).permute(1, 2, 0).float().cpu().numpy()
+        
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(10, 10))
+        
+        ax.imshow(image, cmap='gray' if image.ndim == 2 else None)
+        x_min, y_min, x_max, y_max = bounding_box
+        
+        width = x_max - x_min
+        height = y_max - y_min
+        
+        rect = plt.Rectangle(
+            (x_min, y_min),
+            width, 
+            height, 
+            fill=False,
+            edgecolor='red',
+            linewidth=2
+        )
+        
+        ax.add_patch(rect)
+        plt.tight_layout()
+        
+        return ax
+
+    def save_guidance(self, image: torch.Tensor, output_dir, cur_class, val):
+        bbox = self._compute_bbox(image, cur_class)
+    
+        if not bbox:
+            return
+        
+        class_dir = os.path.join(output_dir, cur_class)
+        os.makedirs(class_dir, exist_ok=True)
+        
+        bbox_path = os.path.join(class_dir, f"{val}_bbox.jpg")
+        fig, ax = plt.subplots(figsize=(10, 10))
+        self._visualize_bounding_box(image, bbox, ax)
+        
+        plt.savefig(bbox_path, bbox_inches='tight', dpi=300)
+        plt.close(fig)
+        
+        # Save bounding box coordinates to JSON
+        bbox_json_path = os.path.join(class_dir, f"{val}_bbox.json")
+        bbox_data = {
+            "class": cur_class,
+            "bbox": {
+                "x_min": bbox[0],
+                "y_min": bbox[1],
+                "x_max": bbox[2],
+                "y_max": bbox[3]
+            },
+            "image_identifier": val
+        }
+        
+        with open(bbox_json_path, 'w') as json_file:
+            json.dump(bbox_data, json_file, indent=4)
+
+    
+    def compute_loss(self, image: torch.Tensor, target: str, cur_class: str):
+        def set_bn_to_eval(m):
+            classname = m.__class__.__name__
+            if classname.find('BatchNorm') != -1:
+                m.eval()
+
+        self.model.train()
+        self.model.backbone.eval()
+        self.model.apply(set_bn_to_eval)
+
+        processed_image = self._preprocess_image(image)
+        
+        gt_bbox = torch.Tensor(
+            self.bbox_annotations[cur_class][target]
+        ).unsqueeze(0).to(torch.float).to(self.device)
+        gt_labels = torch.Tensor(
+            [self.categories.index(cur_class)]
+        ).to(torch.int64).to(self.device)
+        gt = {"boxes": gt_bbox, "labels": gt_labels}
+        
+        loss = self.model(processed_image, [gt])
+        
+        return loss['loss_classifier'] + loss['loss_objectness'] + loss['loss_rpn_box_reg']
+        
 
 class GuidanceFunctionSegmenter:
 
@@ -128,12 +278,12 @@ class UniversalGuidance:
         return np.flip(y_values)
 
 
-    def generate_and_segment(
+    def generate(
         self, 
         annotations_path: str, 
         output_dir: str, 
         cur_class: str = "cat", 
-        num_inference_steps: int = 500,
+        num_inference_steps: int = 20,
         guidance_scale: float = 1.5
     ):
         # Negative prompt to discourage undesirable image characteristics
@@ -268,9 +418,6 @@ class UniversalGuidance:
         with torch.no_grad():
             image = self.pipe.vae.decode(latents / self.pipe.vae.config.scaling_factor, return_dict=False)[0]
 
-            # Save guidance
-            self.guidance_function.save_guidance(image, output_dir, cur_class, val)
-
             # Save outputs
             output_path = os.path.join(output_dir, cur_class, f"{val}.jpg")
             
@@ -282,17 +429,42 @@ class UniversalGuidance:
             
             generated_image.save(output_path)
 
+            # Save guidance
+            self.guidance_function.save_guidance(image, output_dir, cur_class, val)
+
 
 def main():
-    guidance_function = GuidanceFunctionSegmenter()
+    parser = argparse.ArgumentParser(description="Universal Guidance Image Generation")
     
-    generator = UniversalGuidance(guidance_function)
-    generator.generate_and_segment(
-        annotations_path="./processed_data/cat/annotations.json",
-        output_dir="./forward_pass",
-        cur_class="cat"
+    # Add arguments
+    parser.add_argument(
+        "--animal", 
+        type=str, 
+        default="cat", 
+        choices=["cat", "dog", "fox"],
+        help="Specify the animal class for generation (default: cat)"
     )
-
+    parser.add_argument(
+        "--output_dir", 
+        type=str, 
+        default="./forward_pass", 
+        help="Output directory for generated images (default: ./forward_pass)"
+    )
+    
+    # Parse arguments
+    args = parser.parse_args()
+    annotations_path = f"./processed_data/{args.animal}/annotations.json"
+    output_dir = args.output_dir
+    
+    guidance_function = GuidanceFunctionBBox()
+    generator = UniversalGuidance(guidance_function)
+    
+    # Generate images
+    generator.generate(
+        annotations_path=annotations_path,
+        output_dir=output_dir,
+        cur_class=args.animal
+    )
 
 if __name__ == "__main__":
     main()
