@@ -125,25 +125,23 @@ for val, key in annotations.items():
         trans = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
         k = 10
-        m = 10
+        m = 20
         # 7. Denoising loop
         for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
             for _ in range(k):
                 z_t = latents.detach().clone()
-                z_t.requires_grad_(True)
                 latent_model_input = z_t.repeat(2, 1, 1, 1) # classifier free guidance
                 latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
-                # with torch.no_grad():
-                pipe.unet.zero_grad()
-                noise_pred = pipe.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    cross_attention_kwargs=None,
-                    return_dict=False,
-                )[0]
+                with torch.no_grad():
+                    noise_pred = pipe.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        cross_attention_kwargs=None,
+                        return_dict=False,
+                    )[0]
 
                 # classifier free guidance
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -152,26 +150,29 @@ for val, key in annotations.items():
                 alpha_prod_t = pipe.scheduler.alphas_cumprod[timesteps[i]]
                 alpha_prod_t_prev = pipe.scheduler.alphas_cumprod[timesteps[i + 1]] if i + 1 < len(timesteps) else torch.tensor(1.0)
 
-
-                # todo
                 pipe.vae.zero_grad()
                 segmentator.zero_grad()
 
                 z_zero = (z_t - (1 - alpha_prod_t) ** 0.5 * noise_pred) / alpha_prod_t ** 0.5
 
-                img = pipe.vae.decode(z_zero / pipe.vae.config.scaling_factor, return_dict=False)[0]
-                map = (img + 1) * 0.5
-                map = TF.resize(map, (520, 520), interpolation=TF.InterpolationMode.BILINEAR)
-                map = trans(map)
+                 # backward pass
+                delta_z = torch.zeros(z_zero.shape, device=device, requires_grad=True, dtype=z_zero.dtype)
+                optim = torch.optim.AdamW([delta_z], lr=1e-3)
 
-                seg_logits = segmentator(map.to("cuda:0").float())['out']
+                for i in range(m):
+                    img = pipe.vae.decode((z_zero + delta_z) / pipe.vae.config.scaling_factor, return_dict=False)[0]
+                    map = (img + 1) * 0.5
+                    map = TF.resize(map, (520, 520), interpolation=TF.InterpolationMode.BILINEAR)
+                    map = trans(map)
+                    seg_logits = segmentator(map.to("cuda:0").float())['out']
+                    class8_logits = seg_logits[:, label_2_idx_map[cur_class], :, :]
+                    optim.zero_grad()
+                    loss = torch.nn.functional.binary_cross_entropy_with_logits(class8_logits, mask.to("cuda:0").expand(num_images, 520, 520).float())
+                    loss.backward()
+                    optim.step()
 
-                class8_logits = seg_logits[:, label_2_idx_map[cur_class], :, :]
+                noise_pred -= (alpha_prod_t / (1 - alpha_prod_t)) ** 0.5 * delta_z.detach()
 
-                loss = torch.nn.functional.binary_cross_entropy_with_logits(class8_logits, mask.to("cuda:0").expand(num_images, 520, 520).float())
-
-                loss.backward()
-                noise_pred += 400 * (1 - alpha_prod_t)**0.5 * z_t.grad
 
                 # compute the previous noisy sample x_t -> x_t-1
                 next_latents = pipe.scheduler.step(noise_pred, t, latents).prev_sample
@@ -179,30 +180,23 @@ for val, key in annotations.items():
                     + (1 - alpha_prod_t/alpha_prod_t_prev)**0.5 * torch.randn_like(next_latents)
             latents = next_latents
 
-
-            # with torch.no_grad():
-            #     plt.close()
-            #     clear_output()
-            #     image = pipe.vae.decode(latents / pipe.vae.config.scaling_factor, return_dict=False)[0]
-            #     images = pipe.image_processor.postprocess(image.detach(), output_type=output_type, do_denormalize=[True] * num_images)
-            #     show_images_grid(images, rows=2, cols=2)
             
-        with torch.no_grad():
-            plt.close()
-            clear_output()
-            image = pipe.vae.decode(latents / pipe.vae.config.scaling_factor, return_dict=False)[0]
+            with torch.no_grad():
+                plt.close()
+                clear_output()
+                image = pipe.vae.decode(latents / pipe.vae.config.scaling_factor, return_dict=False)[0]
 
-            map = (image + 1) * 0.5
-            map = TF.resize(map, (520, 520), interpolation=TF.InterpolationMode.BILINEAR)
-            trans = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            map = trans(map)
+                map = (image + 1) * 0.5
+                map = TF.resize(map, (520, 520), interpolation=TF.InterpolationMode.BILINEAR)
+                trans = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                map = trans(map)
 
-            plt.imsave(f"/root/forward_pass_no_neg/{cur_class}/{val}_mask.jpg", 
-                       segmentator(map.to("cuda:0").float())["out"][0, label_2_idx_map[cur_class]].detach().cpu())
+                plt.imsave(f"/root/backward_pass/{cur_class}/{t}_{val}_mask.jpg", 
+                        segmentator(map.to("cuda:0").float())["out"][0, label_2_idx_map[cur_class]].detach().cpu())
 
-            images = pipe.image_processor.postprocess(image.detach(), output_type=output_type, do_denormalize=[True] * num_images)
+                images = pipe.image_processor.postprocess(image.detach(), output_type=output_type, do_denormalize=[True] * num_images)
 
-        images[0].save(f"/root/forward_pass_no_neg/{cur_class}/{val}.jpg")
+            images[0].save(f"/root/backward_pass/{cur_class}/{t}_{val}.jpg")
     
     except Exception as e:
         print(str(e))
