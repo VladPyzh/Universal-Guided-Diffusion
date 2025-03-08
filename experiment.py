@@ -283,7 +283,7 @@ class UniversalGuidance:
         annotations_path: str, 
         output_dir: str, 
         cur_class: str = "cat", 
-        num_inference_steps: int = 20,
+        num_inference_steps: int = 500,
         guidance_scale: float = 1.5
     ):
         # Negative prompt to discourage undesirable image characteristics
